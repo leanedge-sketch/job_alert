@@ -278,20 +278,68 @@ def entry_description(entry) -> str:
 def fetch_clean_job_text(job_url: str, rss_fallback: str = "") -> str:
     """Download a job page and extract clean body text via trafilatura.
 
-    Falls back to the RSS feed snippet when fetch/extract fails (e.g. anti-bot).
+    Strategy:
+      1. Fetch HTML with requests (custom User-Agent).
+      2. Extract main content with trafilatura.extract().
+      3. If that fails, try trafilatura.fetch_url() as a second path.
+      4. Fall back to the RSS snippet when the page cannot be scraped.
     """
     if not job_url:
         return rss_fallback or ""
 
+    # Path 1: requests + trafilatura.extract (most reliable with our User-Agent).
+    try:
+        response = requests.get(
+            job_url,
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            timeout=30,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        extracted = trafilatura.extract(
+            response.text,
+            include_comments=False,
+            include_tables=False,
+            favor_precision=True,
+            url=job_url,
+        )
+        if extracted and extracted.strip():
+            text = extracted.strip()
+            print(f"trafilatura extracted {len(text)} chars from {job_url}")
+            return text
+        print(f"trafilatura: no main content extracted from {job_url}")
+    except Exception as exc:
+        print(f"trafilatura/requests fetch failed for {job_url}: {exc}")
+
+    # Path 2: trafilatura's built-in fetcher.
     try:
         downloaded = trafilatura.fetch_url(job_url)
         if downloaded:
-            extracted = trafilatura.extract(downloaded)
+            extracted = trafilatura.extract(
+                downloaded,
+                include_comments=False,
+                include_tables=False,
+                favor_precision=True,
+                url=job_url,
+            )
             if extracted and extracted.strip():
-                return extracted.strip()
+                text = extracted.strip()
+                print(
+                    f"trafilatura.fetch_url extracted {len(text)} chars from {job_url}"
+                )
+                return text
     except Exception as exc:
-        print(f"trafilatura failed for {job_url}: {exc}")
+        print(f"trafilatura.fetch_url failed for {job_url}: {exc}")
 
+    if rss_fallback:
+        print(
+            f"trafilatura unavailable; using RSS snippet "
+            f"({len(rss_fallback)} chars) for {job_url}"
+        )
     return rss_fallback or ""
 
 
@@ -943,10 +991,14 @@ def _contains_phrase(text: str, phrase: str) -> bool:
     return re.search(pattern, text.lower()) is not None
 
 
-def matches_search_filters(title: str, description: str = "") -> bool:
-    """Apply job_titles / locations / blocked_words from SEARCH_CONFIG."""
+def matches_search_filters(title: str, description: str = "", link: str = "") -> bool:
+    """Apply job_titles / locations / blocked_words from SEARCH_CONFIG.
+
+    Location may appear in the title, RSS/page text, or the job URL (common for
+    Indeed/Bayt links), so the link is included in the location check.
+    """
     title_lower = title.lower()
-    combined = f"{title} {description}".lower()
+    combined = f"{title} {description} {link}".lower()
 
     if any(_contains_phrase(combined, blocked) for blocked in SEARCH_CONFIG["blocked_words"]):
         return False
@@ -1005,8 +1057,25 @@ def process_job(
         return False
     if link in seen:
         return False
-    if not matches_search_filters(title, description):
-        return False
+
+    # Title / blocked-word gate first (cheap). Location may only appear after
+    # trafilatura pulls the full page, so we re-check with page text below.
+    if not matches_search_filters(title, description, link=link):
+        # Soft retry: if title matches a job_title and isn't blocked, still
+        # allow through when location is missing from the short RSS snippet.
+        title_ok = any(
+            job_title.lower() in title.lower()
+            for job_title in SEARCH_CONFIG["job_titles"]
+        )
+        blocked = any(
+            _contains_phrase(f"{title} {description}", blocked)
+            for blocked in SEARCH_CONFIG["blocked_words"]
+        )
+        if not title_ok or blocked:
+            return False
+        print(
+            f"Location not in RSS snippet; will verify after trafilatura: {title}"
+        )
 
     # Durable dedup for GitHub Actions when seen_jobs.json cache is cold.
     if notion_job_link_exists(link):
@@ -1021,6 +1090,12 @@ def process_job(
 
     # Prefer full page text for Gemini; keep RSS snippet for filters/metadata.
     gemini_description = fetch_clean_job_text(link, rss_fallback=description)
+
+    # Final filter using trafilatura page text + link (catches Dubai/UAE in body).
+    if not matches_search_filters(title, gemini_description, link=link):
+        print(f"Filtered out after page extract: {title}")
+        seen.add(link)
+        return False
 
     details = parse_job_details(title, description)
     display_source = source_label("", source, link)
