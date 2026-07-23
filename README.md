@@ -27,7 +27,7 @@ Notion database properties must be named exactly:
 - `Position` (Title)
 - `Link` (URL)
 - `Date Found` (Date)
-- `Status` (Select, with option `New`)
+- `Status` (Status type; default set to `Interested`)
 
 ## Local runs
 
