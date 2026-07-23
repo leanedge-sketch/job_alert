@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+bot_run.log
+google_debug*
+bing_*
+*.html
+.DS_Store
