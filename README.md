@@ -20,6 +20,8 @@ Add these repository secrets:
 - `TELEGRAM_CHAT_ID`
 - `RSS_FEED_URLS`
 
-## Local schedule (Windows)
+## Local runs
 
-`JobAlertBot` Task Scheduler job runs `run_bot.bat` every 30 minutes.
+For a one-off check: `python main.py`
+
+Automated checks run via GitHub Actions every 2 hours.
