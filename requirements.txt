@@ -3,4 +3,6 @@ python-dotenv
 requests
 notion-client
 google-generativeai
+google-api-core
 pypdf
+trafilatura

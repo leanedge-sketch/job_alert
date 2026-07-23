@@ -39,6 +39,7 @@ Notion CV Vault properties:
 - `Active` (Checkbox) — set True to include that CV
 - `Minimum Score` (Number) — only log jobs with match_score >= this value
 - `CV File` (Files & media) — optional PDF resume; preferred over page body
+- `Last Processed URL` (URL) — RSS cursor; leave empty on first run
 - Put resume text in the page body as a fallback when no PDF is attached
 
 Also keep optional local fallback `resume.txt` if no active CV Vault rows are found.

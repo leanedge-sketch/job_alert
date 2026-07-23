@@ -1,12 +1,13 @@
 """Job alert bot pipeline.
 
-1. Load active CVs from Notion CV Vault (PDF via CV File, else page body).
-2. Poll Google Alerts RSS feeds (feedparser).
-3. Score each new job against each CV with Gemini (match_score + keywords).
-4. If score >= that CV's Minimum Score:
-   - Log to Notion Job Tracker (Note: "Matched for: [Applicant Name]")
-   - Notify via Telegram Bot API sendMessage
-5. Deduplicate with seen_jobs.json and existing Job Tracker Link URLs.
+1. Load active CVs from Notion CV Vault (PDF via CV File, else page body),
+   including Last Processed URL for RSS cursor state.
+2. Poll Google Alerts RSS feeds (feedparser); stop when Last Processed URL is hit.
+3. For each new job, score every active CV with Gemini (winner-takes-all).
+4. If a winning CV meets its Minimum Score:
+   - Log exactly one Notion Job Tracker row (Note: "Matched for: [Winner]")
+   - Send exactly one Telegram notification
+5. Persist the newest RSS item URL back to each active CV's Last Processed URL.
 """
 
 import argparse
@@ -23,7 +24,13 @@ from pathlib import Path
 import feedparser
 import google.generativeai as genai
 import requests
+import trafilatura
 from dotenv import load_dotenv
+from google.api_core.exceptions import (
+    InternalServerError,
+    ResourceExhausted,
+    ServiceUnavailable,
+)
 from notion_client import Client
 from pypdf import PdfReader
 
@@ -268,6 +275,26 @@ def entry_description(entry) -> str:
     return text
 
 
+def fetch_clean_job_text(job_url: str, rss_fallback: str = "") -> str:
+    """Download a job page and extract clean body text via trafilatura.
+
+    Falls back to the RSS feed snippet when fetch/extract fails (e.g. anti-bot).
+    """
+    if not job_url:
+        return rss_fallback or ""
+
+    try:
+        downloaded = trafilatura.fetch_url(job_url)
+        if downloaded:
+            extracted = trafilatura.extract(downloaded)
+            if extracted and extracted.strip():
+                return extracted.strip()
+    except Exception as exc:
+        print(f"trafilatura failed for {job_url}: {exc}")
+
+    return rss_fallback or ""
+
+
 def _notion_client() -> Client | None:
     if not NOTION_API_TOKEN:
         return None
@@ -300,6 +327,68 @@ def _page_minimum_score(page: dict, default: int = 0) -> int:
     return max(0, min(100, score))
 
 
+def _page_last_processed_url(page: dict) -> str | None:
+    """Read the CV Vault 'Last Processed URL' URL property (RSS cursor)."""
+    props = page.get("properties") or {}
+    prop = props.get("Last Processed URL")
+    if not prop or prop.get("type") != "url":
+        return None
+    url = prop.get("url")
+    if not url or not str(url).strip():
+        return None
+    return str(url).strip()
+
+
+def _shared_last_processed_url(active_cvs: list[dict]) -> str | None:
+    """Return the first non-empty Last Processed URL among active CVs."""
+    for cv in active_cvs:
+        url = (cv.get("last_processed_url") or "").strip()
+        if url:
+            return url
+    return None
+
+
+def update_last_processed_url(active_cvs: list[dict], newest_url: str) -> None:
+    """PATCH Last Processed URL on every active CV Vault page (Notion pages.update)."""
+    newest_url = (newest_url or "").strip()
+    if not newest_url:
+        return
+
+    notion = _notion_client()
+    if notion is None:
+        print("Skipping Last Processed URL update: Notion client unavailable.")
+        return
+
+    updated_any = False
+    for cv in active_cvs:
+        page_id = cv.get("page_id")
+        if not page_id:
+            continue
+        try:
+            notion.pages.update(
+                page_id=page_id,
+                properties={
+                    "Last Processed URL": {"url": newest_url},
+                },
+            )
+            cv["last_processed_url"] = newest_url
+            updated_any = True
+            print(
+                f"CV Vault: set Last Processed URL for '{cv.get('name')}' "
+                f"-> {newest_url}"
+            )
+        except Exception as exc:
+            print(
+                f"CV Vault: failed to update Last Processed URL "
+                f"for '{cv.get('name')}': {exc}"
+            )
+
+    if not updated_any:
+        print(
+            "CV Vault: no active CV page_id available to store Last Processed URL."
+        )
+
+
 def _cv_file_url(page: dict) -> tuple[str | None, str]:
     """Return (url, filename) from the CV Vault 'CV File' Files & media property."""
     props = page.get("properties") or {}
@@ -321,6 +410,19 @@ def _cv_file_url(page: dict) -> tuple[str | None, str]:
     return None, ""
 
 
+MIN_CV_TEXT_CHARS = 100
+
+# Notion block types used when falling back to page body text.
+_PAGE_BODY_BLOCK_TYPES = (
+    "paragraph",
+    "heading_1",
+    "heading_2",
+    "heading_3",
+    "bulleted_list_item",
+    "numbered_list_item",
+)
+
+
 def _extract_pdf_text(pdf_bytes: bytes) -> str:
     """Extract plain text from an in-memory PDF using pypdf."""
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -332,35 +434,8 @@ def _extract_pdf_text(pdf_bytes: bytes) -> str:
     return "\n".join(chunks).strip()
 
 
-def _cv_text_from_page(notion: Client, page: dict, applicant_name: str) -> str:
-    """Prefer PDF from 'CV File'; fall back to Notion page body text."""
-    file_url, file_name = _cv_file_url(page)
-    if file_url:
-        try:
-            response = requests.get(file_url, timeout=60)
-            response.raise_for_status()
-            pdf_text = _extract_pdf_text(response.content)
-            if pdf_text:
-                print(
-                    f"CV Vault: downloaded and parsed PDF for '{applicant_name}' "
-                    f"({file_name}, {len(pdf_text)} chars)."
-                )
-                return pdf_text
-            print(
-                f"CV Vault: PDF for '{applicant_name}' ({file_name}) "
-                "had no extractable text; falling back to page body."
-            )
-        except Exception as exc:
-            print(
-                f"CV Vault: PDF download/parse failed for '{applicant_name}' "
-                f"({file_name}): {exc}; falling back to page body."
-            )
-
-    return _page_plain_text(notion, page["id"])
-
-
 def _page_plain_text(notion: Client, page_id: str) -> str:
-    """Fetch plain text from a Notion page body (all child blocks)."""
+    """Fetch plain text from Notion page body via blocks.children.list."""
     chunks: list[str] = []
     cursor = None
     while True:
@@ -370,6 +445,8 @@ def _page_plain_text(notion: Client, page_id: str) -> str:
         response = notion.blocks.children.list(**kwargs)
         for block in response.get("results", []):
             block_type = block.get("type")
+            if block_type not in _PAGE_BODY_BLOCK_TYPES:
+                continue
             payload = block.get(block_type) or {}
             rich_text = payload.get("rich_text") or []
             text = "".join(part.get("plain_text", "") for part in rich_text).strip()
@@ -379,6 +456,69 @@ def _page_plain_text(notion: Client, page_id: str) -> str:
             break
         cursor = response.get("next_cursor")
     return "\n".join(chunks).strip()
+
+
+def _cv_text_from_page(notion: Client, page: dict, applicant_name: str) -> str:
+    """Load CV text from PDF, with Notion page body fallback if PDF is weak.
+
+    Returns text with at least MIN_CV_TEXT_CHARS, or "" if neither source is usable.
+    """
+    cv_page_id = page.get("id")
+    cv_text = ""
+    file_url, file_name = _cv_file_url(page)
+
+    if file_url:
+        try:
+            response = requests.get(file_url, timeout=60)
+            response.raise_for_status()
+            cv_text = _extract_pdf_text(response.content)
+            if len(cv_text.strip()) >= MIN_CV_TEXT_CHARS:
+                print(
+                    f"CV Vault: downloaded and parsed PDF for '{applicant_name}' "
+                    f"({file_name}, {len(cv_text)} chars)."
+                )
+                return cv_text.strip()
+            print(
+                "PDF text extraction returned less than 100 characters. "
+                "Attempting fallback to Notion Page Body..."
+            )
+        except Exception as exc:
+            print(
+                f"CV Vault: PDF download/parse failed for '{applicant_name}' "
+                f"({file_name}): {exc}"
+            )
+            print(
+                "PDF text extraction returned less than 100 characters. "
+                "Attempting fallback to Notion Page Body..."
+            )
+            cv_text = ""
+    else:
+        # No PDF attached — go straight to page body (same validation rules).
+        print(
+            f"CV Vault: no CV File on '{applicant_name}'; "
+            "reading Notion Page Body..."
+        )
+
+    if cv_page_id:
+        body_text = _page_plain_text(notion, cv_page_id)
+        if len(body_text.strip()) >= MIN_CV_TEXT_CHARS:
+            print(
+                f"CV Vault: using Notion Page Body for '{applicant_name}' "
+                f"({len(body_text)} chars)."
+            )
+            return body_text.strip()
+        # Prefer whichever source had more text for the final check message.
+        if len(body_text.strip()) > len(cv_text.strip()):
+            cv_text = body_text
+
+    if len(cv_text.strip()) < MIN_CV_TEXT_CHARS:
+        print(
+            "No readable CV text found in PDF or Notion page body. "
+            "Skipping CV profile."
+        )
+        return ""
+
+    return cv_text.strip()
 
 
 def _query_active_cv_pages(notion: Client, database_id: str) -> list[dict]:
@@ -439,14 +579,26 @@ def load_active_cvs() -> list[dict]:
       - Active (Checkbox) -> must be True to be used
       - Minimum Score (Number) -> per-CV match threshold (0-100)
       - CV File (Files & media) -> optional PDF resume attachment
+      - Last Processed URL (URL) -> RSS cursor (may be empty on first run)
 
-    Resume text prefers PDF from CV File; falls back to page body plain text.
-    Returns list of dicts: {"name", "minimum_score", "text"}.
+    Resume text prefers PDF from CV File. If PDF text is under 100 characters,
+    falls back to Notion page body (paragraph/heading/list blocks). Profiles
+    with still-insufficient text are skipped.
+    Returns list of dicts: {"name", "minimum_score", "text", "page_id",
+    "last_processed_url"}.
     Falls back to local resume.txt when vault is empty/unavailable.
     """
     fallback_text = resume_text
     fallback = (
-        [{"name": "Local resume.txt", "minimum_score": 0, "text": fallback_text}]
+        [
+            {
+                "name": "Local resume.txt",
+                "minimum_score": 0,
+                "text": fallback_text,
+                "page_id": None,
+                "last_processed_url": None,
+            }
+        ]
         if fallback_text
         else []
     )
@@ -465,18 +617,19 @@ def load_active_cvs() -> list[dict]:
         for page in pages:
             name = _page_title(page)
             minimum_score = _page_minimum_score(page, default=0)
+            last_processed_url = _page_last_processed_url(page)
             text = _cv_text_from_page(notion, page, name)
-            if not text:
-                print(
-                    f"CV Vault: active page '{name}' has no PDF text "
-                    "and empty body; skipping."
-                )
+            if len(text.strip()) < MIN_CV_TEXT_CHARS:
+                # Warning already logged inside _cv_text_from_page when both
+                # PDF and page body failed the 100-character check.
                 continue
             active_cvs.append(
                 {
                     "name": name,
                     "minimum_score": minimum_score,
                     "text": text,
+                    "page_id": page.get("id"),
+                    "last_processed_url": last_processed_url,
                 }
             )
 
@@ -486,14 +639,58 @@ def load_active_cvs() -> list[dict]:
 
         print(f"CV Vault: loaded {len(active_cvs)} active CV(s).")
         for cv in active_cvs:
+            cursor = cv.get("last_processed_url") or "(empty — first run)"
             print(
                 f"  - {cv['name']} (minimum score: {cv['minimum_score']}, "
-                f"{len(cv['text'])} chars)"
+                f"{len(cv['text'])} chars, Last Processed URL: {cursor})"
             )
         return active_cvs
     except Exception as exc:
         print(f"CV Vault error (using resume.txt fallback): {exc}")
         return fallback
+
+
+def safe_gemini_generate(prompt: str, max_retries: int = 3):
+    """Call Gemini generate_content with exponential backoff on rate/service errors.
+
+    Retries on ResourceExhausted, ServiceUnavailable, and InternalServerError.
+    wait_time = 10 * (2 ** attempt) seconds between tries.
+    Returns the response object, or None if all retries fail.
+    """
+    if not GEMINI_API_KEY:
+        print("Gemini skipped: GEMINI_API_KEY not set.")
+        return None
+
+    genai.configure(api_key=GEMINI_API_KEY)
+    model = genai.GenerativeModel(
+        "gemini-3.6-flash",
+        generation_config={
+            "response_mime_type": "application/json",
+            "temperature": 0.2,
+        },
+    )
+
+    for attempt in range(max_retries):
+        try:
+            return model.generate_content(prompt)
+        except (ResourceExhausted, ServiceUnavailable, InternalServerError) as exc:
+            wait_time = 10 * (2 ** attempt)
+            if attempt >= max_retries - 1:
+                print(
+                    f"ERROR: Gemini API failed after {max_retries} attempts "
+                    f"({type(exc).__name__}: {exc}). Giving up."
+                )
+                return None
+            print(
+                f"API limit hit or service unavailable. "
+                f"Retrying in {wait_time} seconds..."
+            )
+            time.sleep(wait_time)
+        except Exception as exc:
+            print(f"Gemini generate_content error: {exc}")
+            return None
+
+    return None
 
 
 def analyze_job_with_gemini(
@@ -503,10 +700,20 @@ def analyze_job_with_gemini(
 ) -> dict:
     """Compare a candidate resume to a job posting with Gemini.
 
-    Returns {"match_score": int, "keywords": list[str]}.
-    On failure defaults to score 0 and ["AI Parse Failed"].
+    Returns {
+      "match_score": int,
+      "keywords": list[str],
+      "cover_letter": str,
+      "tailored_cv": str,
+    }.
+    On failure defaults to score 0, ["AI Parse Failed"], and empty strings.
     """
-    fallback = {"match_score": 0, "keywords": ["AI Parse Failed"]}
+    fallback = {
+        "match_score": 0,
+        "keywords": ["AI Parse Failed"],
+        "cover_letter": "",
+        "tailored_cv": "",
+    }
     if not GEMINI_API_KEY:
         print("Gemini skipped: GEMINI_API_KEY not set.")
         return fallback
@@ -517,26 +724,27 @@ def analyze_job_with_gemini(
     )
     prompt = (
         "You are an expert technical recruiter. Evaluate the provided job description "
-        "against the candidate's CV. Return a strict JSON response with two keys: "
+        "against the candidate's CV. Return a strict JSON response with four keys: "
         "'match_score' (an integer from 0 to 100 representing the probability of a "
-        "strong match based strictly on the candidate's documented experience) and "
+        "strong match based strictly on the candidate's documented experience), "
         "'keywords' (a list of 3 to 5 critical skills required by the job that are "
         "EXPLICITLY present in the candidate's CV. Do not list skills the job requires "
-        "if the candidate does not possess them).\n\n"
+        "if the candidate does not possess them), "
+        "'cover_letter' (a string: if match_score is high, write a highly persuasive "
+        "cover letter focused on the overlapping skills between the CV and the job; "
+        "otherwise use an empty string), and "
+        "'tailored_cv' (a string: if match_score is high, rewrite the provided CV's "
+        "summary and bullet points to specifically mirror the terminology and "
+        "requirements of the job description WITHOUT inventing fake experience; "
+        "otherwise use an empty string).\n\n"
         f"Candidate resume:\n{cv_content}\n\n"
         f"Job description:\n{job_description}"
     )
 
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel(
-            "gemini-3.6-flash",
-            generation_config={
-                "response_mime_type": "application/json",
-                "temperature": 0.2,
-            },
-        )
-        response = model.generate_content(prompt)
+        response = safe_gemini_generate(prompt)
+        if response is None:
+            return fallback
         data = json.loads(response.text)
         match_score = int(data["match_score"])
         keywords = [
@@ -548,10 +756,62 @@ def analyze_job_with_gemini(
             raise ValueError(f"match_score out of range: {match_score}")
         if not keywords:
             keywords = ["AI Parse Failed"]
-        return {"match_score": match_score, "keywords": keywords[:5]}
+        cover_letter = str(data.get("cover_letter") or "").strip()
+        tailored_cv = str(data.get("tailored_cv") or "").strip()
+        return {
+            "match_score": match_score,
+            "keywords": keywords[:5],
+            "cover_letter": cover_letter,
+            "tailored_cv": tailored_cv,
+        }
     except Exception as exc:
         print(f"Gemini error: {exc}")
         return fallback
+
+
+NOTION_RICH_TEXT_LIMIT = 2000
+
+
+def _chunk_text_for_notion(text: str, limit: int = NOTION_RICH_TEXT_LIMIT) -> list[str]:
+    """Split text into chunks that fit Notion rich_text content limits."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ["(Not generated)"]
+    return [cleaned[i : i + limit] for i in range(0, len(cleaned), limit)]
+
+
+def _notion_heading_2(title: str) -> dict:
+    return {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {
+            "rich_text": [
+                {"type": "text", "text": {"content": (title or "")[:NOTION_RICH_TEXT_LIMIT]}}
+            ]
+        },
+    }
+
+
+def _notion_paragraph_blocks(text: str) -> list[dict]:
+    return [
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": [{"type": "text", "text": {"content": chunk}}]
+            },
+        }
+        for chunk in _chunk_text_for_notion(text)
+    ]
+
+
+def _job_tracker_page_children(cover_letter: str, tailored_cv: str) -> list[dict]:
+    """Build Notion page body blocks for cover letter + tailored CV."""
+    children: list[dict] = [_notion_heading_2("Auto-Generated Cover Letter")]
+    children.extend(_notion_paragraph_blocks(cover_letter))
+    children.append(_notion_heading_2("Tailored CV"))
+    children.extend(_notion_paragraph_blocks(tailored_cv))
+    return children
 
 
 def add_job_to_notion(
@@ -561,6 +821,8 @@ def add_job_to_notion(
     match_score: int = 0,
     keywords: list[str] | None = None,
     note: str = "Auto-logged via Gemini Matcher",
+    cover_letter: str = "",
+    tailored_cv: str = "",
 ) -> None:
     """Create a Notion database row for a newly found job.
 
@@ -574,6 +836,8 @@ def add_job_to_notion(
       - Applied     -> Checkbox (default: unchecked)
       - Note        -> Rich text
 
+    Page body children include Auto-Generated Cover Letter and Tailored CV.
+
     Env vars required:
       - NOTION_API_TOKEN
       - NOTION_DATABASE_ID
@@ -584,6 +848,10 @@ def add_job_to_notion(
 
     keyword_list = keywords or ["AI Parse Failed"]
     note_text = (note or "Auto-logged via Gemini Matcher")[:2000]
+    children = _job_tracker_page_children(
+        cover_letter=str(cover_letter or ""),
+        tailored_cv=str(tailored_cv or ""),
+    )
     try:
         notion = Client(auth=NOTION_API_TOKEN)
         notion.pages.create(
@@ -624,6 +892,7 @@ def add_job_to_notion(
                     ],
                 },
             },
+            children=children,
         )
         print(f"Added to Notion ({source}): {job_title}")
     except Exception as exc:
@@ -721,14 +990,16 @@ def process_job(
     description: str = "",
     active_cvs: list[dict] | None = None,
 ) -> bool:
-    """Score one RSS job against every active CV; dual-output on threshold hits.
+    """Score one job against all active CVs; alert only for the single best winner.
 
-    Pipeline per job:
-      1. Skip if link already in seen_jobs.json or Job Tracker (Link URL).
-      2. For each active CV (PDF text preferred), ask Gemini for match_score/keywords.
-      3. If match_score >= that CV's Minimum Score:
-           - Notion Job Tracker row (Note: "Matched for: [Applicant Name]")
-           - Telegram sendMessage with title, link, score, keywords, CV name
+    Winner logic:
+      1. Skip if already seen / already in Job Tracker / fails search filters.
+      2. Fetch job text (trafilatura, RSS fallback).
+      3. For each CV: Gemini score + optional cover_letter/tailored_cv; keep the
+         highest score that also meets that CV's Minimum Score.
+      4. After all CVs: at most one Notion row (with cover letter + tailored CV in
+         the page body) and one Telegram alert for the winner.
+      5. time.sleep(5) after each CV Gemini call to throttle API usage.
     """
     if not title or not link:
         return False
@@ -748,9 +1019,17 @@ def process_job(
         print(f"No active CVs available; skipping job: {title}")
         return False
 
+    # Prefer full page text for Gemini; keep RSS snippet for filters/metadata.
+    gemini_description = fetch_clean_job_text(link, rss_fallback=description)
+
     details = parse_job_details(title, description)
     display_source = source_label("", source, link)
-    sent_any = False
+
+    best_score = -1
+    best_cv_name: str | None = None
+    best_keywords: list[str] = []
+    best_cover_letter = ""
+    best_tailored_cv = ""
 
     for cv in cvs:
         applicant_name = cv.get("name") or "Unnamed CV"
@@ -759,27 +1038,50 @@ def process_job(
 
         analysis = analyze_job_with_gemini(
             title,
-            description,
+            gemini_description,
             candidate_resume=cv_text,
         )
         match_score = int(analysis["match_score"])
         keywords = list(analysis["keywords"])
+        cover_letter = str(analysis.get("cover_letter") or "")
+        tailored_cv = str(analysis.get("tailored_cv") or "")
 
-        if match_score < minimum_score:
+        print(
+            f"Scored {applicant_name}: {match_score}% "
+            f"(minimum {minimum_score}%) for {title}"
+        )
+
+        if match_score >= minimum_score and match_score > best_score:
+            best_score = match_score
+            best_cv_name = applicant_name
+            best_keywords = keywords
+            best_cover_letter = cover_letter
+            best_tailored_cv = tailored_cv
+            print(
+                f"New winner: {best_cv_name} at {best_score}% "
+                f"for {title}"
+            )
+        elif match_score < minimum_score:
             print(
                 f"Below threshold ({match_score}% < {minimum_score}%) "
                 f"for {applicant_name}: {title}"
             )
-            continue
 
-        note = f"Matched for: {applicant_name}"
+        # Proactive throttle between CV evaluations against the same job.
+        time.sleep(5)
+
+    sent = False
+    if best_cv_name is not None:
+        note = f"Matched for: {best_cv_name}"
         add_job_to_notion(
             title,
             link,
             display_source,
-            match_score=match_score,
-            keywords=keywords,
+            match_score=best_score,
+            keywords=best_keywords,
             note=note,
+            cover_letter=best_cover_letter,
+            tailored_cv=best_tailored_cv,
         )
         send_telegram_message(
             format_job_message(
@@ -788,32 +1090,51 @@ def process_job(
                 link,
                 details["location"],
                 details["salary"],
-                match_score,
-                keywords,
-                cv_name=applicant_name,
+                best_score,
+                best_keywords,
+                cv_name=best_cv_name,
             ),
             disable_web_page_preview=False,
         )
-        sent_any = True
+        sent = True
         print(
-            f"Sent alert ({display_source}, {applicant_name}, "
-            f"{match_score}% >= {minimum_score}%): {title}"
+            f"Winner alert ({display_source}, {best_cv_name}, "
+            f"{best_score}%): {title}"
         )
-        time.sleep(0.4)  # avoid Telegram flood limits
+    else:
+        print(f"No CV met threshold for: {title}")
 
     # Mark seen after evaluating all active CVs so we don't re-score forever.
     seen.add(link)
-    return sent_any
+    return sent
 
 
 def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
+    """Fetch Google Alerts RSS feeds and process only items newer than the cursor.
+
+    Stops each feed when an entry.link matches Last Processed URL (from CV Vault).
+    After all feeds, PATCHes Last Processed URL on active CV rows to the newest
+    item from the first non-empty feed. Empty/None cursor = first run
+    (process all current items, then save the newest URL).
+    """
     feed_urls = load_feed_urls()
     if not feed_urls:
         print("No RSS_FEED_URLS configured; skipping RSS check.")
         return 0
 
     cvs = active_cvs if active_cvs is not None else load_active_cvs()
+    last_processed_url = _shared_last_processed_url(cvs)
+    if last_processed_url:
+        print(f"RSS cursor (Last Processed URL): {last_processed_url}")
+    else:
+        print(
+            "RSS cursor empty — first run (or unset). "
+            "Processing current feed items, then saving newest URL."
+        )
+
     new_alerts = 0
+    newest_to_persist: str | None = None
+
     for feed_url in feed_urls:
         try:
             feed = fetch_feed(feed_url)
@@ -826,14 +1147,33 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
             continue
 
         source = source_label(feed_url, feed.feed.get("title", ""))
+        entries = list(feed.entries or [])
         print(
-            f"[{source}] Fetched {len(feed.entries)} "
-            f"entr{'y' if len(feed.entries) == 1 else 'ies'}."
+            f"[{source}] Fetched {len(entries)} "
+            f"entr{'y' if len(entries) == 1 else 'ies'}."
         )
+        if not entries:
+            continue
 
-        for entry in feed.entries:
-            title = entry.get("title", "").strip()
-            link = entry.get("link", "").strip()
+        newest_link = (entries[0].get("link") or "").strip()
+        if newest_to_persist is None and newest_link:
+            newest_to_persist = newest_link
+
+        for entry in entries:
+            title = (entry.get("title") or "").strip()
+            link = (entry.get("link") or "").strip()
+            if not link:
+                continue
+
+            # Newest-first feed: hitting the saved cursor means older items
+            # were already handled in a previous run — stop without Gemini.
+            if last_processed_url and link == last_processed_url:
+                print(
+                    f"[{source}] Reached Last Processed URL; "
+                    "stopping feed (no re-processing)."
+                )
+                break
+
             description = entry_description(entry)
             if process_job(
                 title,
@@ -844,6 +1184,14 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
                 active_cvs=cvs,
             ):
                 new_alerts += 1
+
+    if newest_to_persist:
+        if newest_to_persist != last_processed_url:
+            update_last_processed_url(cvs, newest_to_persist)
+        else:
+            print(f"Last Processed URL already up to date ({newest_to_persist}).")
+    else:
+        print("No RSS items found; leaving Last Processed URL unchanged.")
 
     return new_alerts
 
