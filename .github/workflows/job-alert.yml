@@ -2,8 +2,8 @@ name: Job Alert Scraper Schedule
 
 on:
   schedule:
-    # Every 2 hours
-    - cron: "0 */2 * * *"
+    # Every 15 minutes (GitHub may delay slightly under load)
+    - cron: "*/15 * * * *"
   workflow_dispatch:
 
 jobs:

@@ -13,7 +13,7 @@ Python bot that checks Google Alert RSS feeds for matching IT support roles and 
 
 ## GitHub Actions
 
-The workflow runs every 2 hours (and on manual dispatch).
+The workflow runs every 15 minutes (and on manual dispatch).
 
 Add these repository secrets:
 - `TELEGRAM_BOT_TOKEN`
@@ -24,4 +24,4 @@ Add these repository secrets:
 
 For a one-off check: `python main.py`
 
-Automated checks run via GitHub Actions every 2 hours.
+Automated checks run via GitHub Actions every 15 minutes.
