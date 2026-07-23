@@ -21,13 +21,27 @@ Add these repository secrets:
 - `RSS_FEED_URLS`
 - `NOTION_API_TOKEN`
 - `NOTION_DATABASE_ID`
+- `NOTION_CV_VAULT_ID`
 - `GEMINI_API_KEY`
 
-Notion database properties must be named exactly:
+Notion Job Tracker properties must be named exactly:
 - `Position` (Title)
 - `Link` (URL)
 - `Date Found` (Date)
-- `Status` (Status type; default set to `Interested`)
+- `Status` (Select; default `To Apply`)
+- `Match Score` (Number)
+- `Keywords` (Multi-select)
+- `Applied` (Checkbox; default unchecked)
+- `Note` (Rich text; set to `Matched for: [Applicant Name]`)
+
+Notion CV Vault properties:
+- Title property (any name) for the applicant name
+- `Active` (Checkbox) — set True to include that CV
+- `Minimum Score` (Number) — only log jobs with match_score >= this value
+- `CV File` (Files & media) — optional PDF resume; preferred over page body
+- Put resume text in the page body as a fallback when no PDF is attached
+
+Also keep optional local fallback `resume.txt` if no active CV Vault rows are found.
 
 ## Local runs
 
