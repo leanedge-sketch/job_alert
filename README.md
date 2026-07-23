@@ -19,6 +19,15 @@ Add these repository secrets:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_CHAT_ID`
 - `RSS_FEED_URLS`
+- `NOTION_API_TOKEN`
+- `NOTION_DATABASE_ID`
+- `GEMINI_API_KEY`
+
+Notion database properties must be named exactly:
+- `Position` (Title)
+- `Link` (URL)
+- `Date Found` (Date)
+- `Status` (Select, with option `To Apply`)
 
 ## Local runs
 

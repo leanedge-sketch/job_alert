@@ -1,3 +1,5 @@
 feedparser
 python-dotenv
 requests
+notion-client
+google-generativeai

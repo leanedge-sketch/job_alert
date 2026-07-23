@@ -1,0 +1,26 @@
+{
+  "job_titles": [
+    "Support Specialist",
+    "System Administrator",
+    "Systems Administrator",
+    "IT Support",
+    "Helpdesk",
+    "Help Desk",
+    "Service Desk"
+  ],
+  "locations": [
+    "UAE",
+    "Dubai",
+    "Abu Dhabi",
+    "United Arab Emirates",
+    "Retail"
+  ],
+  "blocked_words": [
+    "internship",
+    "intern",
+    "unpaid",
+    "director",
+    "vice president",
+    "vp of"
+  ]
+}
