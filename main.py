@@ -275,7 +275,7 @@ def add_job_to_notion(job_title: str, job_url: str, source: str) -> None:
       - Position   -> Title
       - Link       -> URL
       - Date Found -> Date
-      - Status     -> Select  (must include an option named exactly: To Apply)
+      - Status     -> Select  (must include an option named exactly: New)
 
     Env vars required:
       - NOTION_API_TOKEN
@@ -305,9 +305,9 @@ def add_job_to_notion(job_title: str, job_url: str, source: str) -> None:
                     "date": {"start": date.today().isoformat()},
                 },
                 # Must be named exactly "Status" and type Select
-                # Must include select option named exactly "To Apply"
+                # Must include select option named exactly "New"
                 "Status": {
-                    "select": {"name": "To Apply"},
+                    "select": {"name": "New"},
                 },
             },
         )
