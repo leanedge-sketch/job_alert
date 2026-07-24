@@ -7,6 +7,7 @@
 4. If a winning CV meets its Minimum Score:
    - Log exactly one Notion Job Tracker row (Note: "Matched for: [Winner]")
    - Send exactly one Telegram notification
+   - Generate a PDF (cover letter + tailored CV) and sendDocument via Telegram
 5. Persist the newest RSS item URL back to each active CV's Last Processed URL.
 """
 
@@ -32,6 +33,7 @@ from google.api_core.exceptions import (
     ServiceUnavailable,
 )
 from notion_client import Client
+from fpdf import FPDF
 from pypdf import PdfReader
 
 from google_backfill import fetch_google_jobs
@@ -187,6 +189,90 @@ def send_telegram_message(
         payload["reply_markup"] = reply_markup
     response = requests.post(url, json=payload, timeout=30)
     response.raise_for_status()
+
+
+def _pdf_safe_text(text: str) -> str:
+    """Normalize text for core PDF fonts (latin-1)."""
+    cleaned = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    # Common Unicode punctuation from Gemini → ASCII stand-ins.
+    replacements = {
+        "\u2018": "'",
+        "\u2019": "'",
+        "\u201c": '"',
+        "\u201d": '"',
+        "\u2013": "-",
+        "\u2014": "-",
+        "\u2022": "-",
+        "\u00a0": " ",
+    }
+    for src, dst in replacements.items():
+        cleaned = cleaned.replace(src, dst)
+    return cleaned.encode("latin-1", "replace").decode("latin-1")
+
+
+def generate_application_pdf(
+    job_title: str,
+    cover_letter: str,
+    tailored_cv: str,
+) -> str:
+    """Build a local PDF with cover letter + tailored CV; return the file path."""
+    safe_title = re.sub(r"[^\w\-]+", "_", job_title or "job").strip("_")[:80] or "job"
+    pdf_filename = f"application_{safe_title}.pdf"
+    pdf_path = str(Path(__file__).parent / pdf_filename)
+
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+
+    # Cover letter
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.multi_cell(0, 8, _pdf_safe_text("Cover Letter"))
+    pdf.ln(2)
+    pdf.set_font("Arial", "B", 11)
+    pdf.multi_cell(0, 6, _pdf_safe_text(job_title or ""))
+    pdf.ln(4)
+    pdf.set_font("Arial", size=11)
+    pdf.multi_cell(
+        0,
+        5,
+        _pdf_safe_text(cover_letter or "(Not generated)"),
+    )
+
+    # Tailored CV
+    pdf.add_page()
+    pdf.set_font("Arial", "B", 14)
+    pdf.multi_cell(0, 8, _pdf_safe_text("Tailored CV"))
+    pdf.ln(2)
+    pdf.set_font("Arial", "B", 11)
+    pdf.multi_cell(0, 6, _pdf_safe_text(job_title or ""))
+    pdf.ln(4)
+    pdf.set_font("Arial", size=11)
+    pdf.multi_cell(
+        0,
+        5,
+        _pdf_safe_text(tailored_cv or "(Not generated)"),
+    )
+
+    pdf.output(pdf_path)
+    print(f"Generated application PDF: {pdf_path}")
+    return pdf_path
+
+
+def send_telegram_document(pdf_filename: str, caption: str = "") -> None:
+    """Send a local PDF via Telegram Bot API sendDocument."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    data = {"chat_id": TELEGRAM_CHAT_ID}
+    if caption:
+        data["caption"] = caption[:1024]
+    with open(pdf_filename, "rb") as doc:
+        response = requests.post(
+            url,
+            data=data,
+            files={"document": doc},
+            timeout=60,
+        )
+    response.raise_for_status()
+    print(f"Sent Telegram document: {pdf_filename}")
 
 
 def parse_job_details(title: str, description: str = "") -> dict[str, str]:
@@ -1171,6 +1257,31 @@ def process_job(
             ),
             disable_web_page_preview=False,
         )
+
+        pdf_path = None
+        try:
+            pdf_path = generate_application_pdf(
+                title,
+                best_cover_letter,
+                best_tailored_cv,
+            )
+            send_telegram_document(
+                pdf_path,
+                caption=(
+                    f"Application pack for {title}\n"
+                    f"Matched CV: {best_cv_name} ({best_score}%)"
+                ),
+            )
+        except Exception as pdf_exc:
+            print(f"PDF generate/send failed (continuing): {pdf_exc}")
+        finally:
+            if pdf_path and os.path.exists(pdf_path):
+                try:
+                    os.remove(pdf_path)
+                    print(f"Deleted local PDF: {pdf_path}")
+                except OSError as cleanup_exc:
+                    print(f"Could not delete PDF {pdf_path}: {cleanup_exc}")
+
         sent = True
         print(
             f"Winner alert ({display_source}, {best_cv_name}, "

@@ -6,3 +6,4 @@ google-generativeai
 google-api-core
 pypdf
 trafilatura
+fpdf
