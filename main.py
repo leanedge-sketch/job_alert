@@ -84,7 +84,6 @@ DEFAULT_SEARCH_CONFIG = {
         "Dubai",
         "Abu Dhabi",
         "United Arab Emirates",
-        "Retail",
     ],
     "blocked_words": [
         "internship",
