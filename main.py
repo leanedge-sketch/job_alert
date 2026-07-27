@@ -74,6 +74,7 @@ DEFAULT_SEARCH_CONFIG = {
         "Support Specialist",
         "System Administrator",
         "Systems Administrator",
+        "IT Administrator",
         "IT Support",
         "Helpdesk",
         "Help Desk",
