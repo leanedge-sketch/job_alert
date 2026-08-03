@@ -70,7 +70,7 @@ confirm `<entry>` items appear, then put the URLs in `RSS_FEED_URLS`.
 
 ## GitHub Actions
 
-The workflow runs every 15 minutes (and on manual dispatch). Overlapping runs
+The workflow runs every 30 minutes (and on manual dispatch). Overlapping runs
 are blocked by a `concurrency` group so alerts and quota are never doubled, and
 each run is capped at 20 minutes.
 
@@ -135,4 +135,4 @@ python send_backfill.py            # process curated backfill_week.json
 
 Alerts are **score-only** by default (saves Gemini quota). Each Telegram alert includes a
 **Generate cover letter + CV** button; packs are generated only when you tap it, and are
-picked up on the next `main.py` / Actions run (every ~15 minutes).
+picked up on the next `main.py` / Actions run (every ~30 minutes).
