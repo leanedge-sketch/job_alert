@@ -2,23 +2,31 @@
 
 1. Load active CVs from Notion CV Vault (PDF via CV File, else page body),
    including Last Processed URL for RSS cursor state.
-2. Poll Google Alerts RSS feeds (feedparser); stop when Last Processed URL is hit.
-3. For each new job, score every active CV with Gemini (winner-takes-all).
-4. If a winning CV meets its Minimum Score:
+2. Poll Telegram for "Generate pack" button presses (on-demand Gemini writes).
+3. Discover jobs from free sources:
+   - LinkedIn public guest search
+   - Indeed / Bayt / Naukrigulf via Google News RSS (direct scrapes are blocked)
+   - Google Alerts RSS feeds (best-effort; often empty for days)
+4. For each new job, score every active CV with Gemini (score + keywords only),
+   within a self-imposed daily/per-run call budget so the free tier is never
+   exhausted mid-run.
+5. If a winning CV meets its Minimum Score:
    - Log exactly one Notion Job Tracker row (Note: "Matched for: [Winner]")
-   - Send exactly one Telegram notification
-   - Generate a PDF (cover letter + tailored CV) and sendDocument via Telegram
-5. Persist the newest RSS item URL back to each active CV's Last Processed URL.
+   - Send exactly one Telegram notification with a Generate pack button
+6. Persist the newest RSS item URL back to each active CV's Last Processed URL.
+7. Emit a periodic heartbeat so "no alerts" is distinguishable from "broken".
 """
 
 import argparse
+import hashlib
 import io
 import json
 import os
 import re
+import sys
 import time
 import traceback
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 
@@ -37,8 +45,23 @@ from fpdf import FPDF
 from pypdf import PdfReader
 
 from google_backfill import fetch_google_jobs
+from job_sources import (
+    fetch_bayt_jobs,
+    fetch_indeed_jobs,
+    fetch_linkedin_jobs,
+    fetch_naukrigulf_jobs,
+)
 
 load_dotenv()
+
+# Job titles routinely contain en-dashes, curly quotes and emoji. On Windows the
+# console defaults to cp1252, where a single print() of such a title raises
+# UnicodeEncodeError and aborts the whole run.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -48,8 +71,51 @@ NOTION_CV_VAULT_ID = os.getenv("NOTION_CV_VAULT_ID")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 SEEN_JOBS_FILE = Path(__file__).parent / "seen_jobs.json"
+PACK_REQUESTS_FILE = Path(__file__).parent / "pack_requests.json"
+TELEGRAM_OFFSET_FILE = Path(__file__).parent / "telegram_offset.json"
+BOT_STATE_FILE = Path(__file__).parent / "bot_state.json"
 CONFIG_FILE = Path(__file__).parent / "config.json"
 RESUME_FILE = Path(__file__).parent / "resume.txt"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"Warning: {name}={raw!r} is not an integer; using {default}.")
+        return default
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+# Free-tier Gemini allows ~20 requests/day. The bot rations itself below that
+# ceiling so it never starts returning 0% "AI Parse Failed" scores mid-run.
+GEMINI_MAX_CALLS_PER_DAY = _env_int("GEMINI_MAX_CALLS_PER_DAY", 18)
+GEMINI_MAX_CALLS_PER_RUN = _env_int("GEMINI_MAX_CALLS_PER_RUN", 8)
+GEMINI_CALL_SPACING_SECONDS = _env_int("GEMINI_CALL_SPACING_SECONDS", 2)
+# Reserve part of the daily budget for on-demand pack generation (button taps).
+GEMINI_PACK_RESERVE = _env_int("GEMINI_PACK_RESERVE", 2)
+# Never alert below this score, even if a CV's Minimum Score is 0.
+MIN_ALERT_SCORE = _env_int("MIN_ALERT_SCORE", 40)
+
+LINKEDIN_SEARCH_ENABLED = _env_flag("LINKEDIN_SEARCH_ENABLED", True)
+LINKEDIN_SEARCH_HOURS = _env_int("LINKEDIN_SEARCH_HOURS", 24)
+LINKEDIN_MAX_JOBS = _env_int("LINKEDIN_MAX_JOBS", 30)
+
+INDEED_SEARCH_ENABLED = _env_flag("INDEED_SEARCH_ENABLED", True)
+BAYT_SEARCH_ENABLED = _env_flag("BAYT_SEARCH_ENABLED", True)
+NAUKRIGULF_SEARCH_ENABLED = _env_flag("NAUKRIGULF_SEARCH_ENABLED", True)
+BOARD_MAX_JOBS = _env_int("BOARD_MAX_JOBS", 15)
+
+HEARTBEAT_HOURS = _env_int("HEARTBEAT_HOURS", 24)
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -79,6 +145,18 @@ DEFAULT_SEARCH_CONFIG = {
         "Helpdesk",
         "Help Desk",
         "Service Desk",
+        "Desktop Support",
+        "Technical Support",
+        "Tech Support",
+        "Application Support",
+        "L1 Support",
+        "L2 Support",
+        "NOC",
+        "SysAdmin",
+        "Sys Admin",
+        "IT Helpdesk",
+        "IT Help Desk",
+        "Infrastructure Support",
     ],
     "locations": [
         "UAE",
@@ -95,6 +173,23 @@ DEFAULT_SEARCH_CONFIG = {
         "vp of",
     ],
 }
+
+# Job board hosts/paths that already imply a target location (UAE/Gulf).
+# Used when trafilatura fails and the RSS snippet has no city name.
+UAE_LOCATION_LINK_MARKERS = (
+    "ae.indeed.com",
+    "indeed.ae",
+    "bayt.com/en/uae",
+    "bayt.com/en/dubai",
+    "bayt.com/en/abu-dhabi",
+    "naukrigulf.com",
+    "/jobs-in-dubai",
+    "/jobs-in-abu-dhabi",
+    "/jobs-in-uae",
+    "location=dubai",
+    "location=uae",
+    "location=abu",
+)
 
 
 def load_search_config() -> dict:
@@ -149,6 +244,92 @@ def save_seen_jobs(seen: set[str]) -> None:
         json.dump(sorted(seen), f, indent=2)
 
 
+# --- Durable run state (Telegram offset, Gemini usage, heartbeat) -------------
+
+RUN_STATS = {
+    "sources": [],
+    "considered": 0,
+    "alerts": 0,
+    "deferred_quota": 0,
+    "filtered": 0,
+    "packs": 0,
+    "warnings": [],
+}
+
+
+def load_bot_state() -> dict:
+    """Read persisted counters; migrate the older telegram_offset.json layout."""
+    state: dict = {}
+    if BOT_STATE_FILE.exists():
+        try:
+            loaded = json.loads(BOT_STATE_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                state = loaded
+        except Exception as exc:
+            print(f"Warning: could not read {BOT_STATE_FILE.name} ({exc}).")
+    if "telegram_offset" not in state and TELEGRAM_OFFSET_FILE.exists():
+        try:
+            legacy = json.loads(TELEGRAM_OFFSET_FILE.read_text(encoding="utf-8"))
+            state["telegram_offset"] = int(legacy.get("offset") or 0)
+        except Exception:
+            pass
+    return state
+
+
+def save_bot_state(state: dict) -> None:
+    try:
+        BOT_STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"Warning: could not write {BOT_STATE_FILE.name} ({exc}).")
+
+
+_BOT_STATE = load_bot_state()
+_gemini_run_calls = 0
+_gemini_hard_stop = False
+
+
+def _today_key() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def gemini_calls_today() -> int:
+    usage = _BOT_STATE.get("gemini_usage") or {}
+    try:
+        return int(usage.get(_today_key()) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def record_gemini_call() -> None:
+    """Count a Gemini request against the run and daily budgets."""
+    global _gemini_run_calls
+    _gemini_run_calls += 1
+    today = _today_key()
+    usage = {
+        day: count
+        for day, count in (_BOT_STATE.get("gemini_usage") or {}).items()
+        if day >= (datetime.now(timezone.utc).date() - timedelta(days=3)).isoformat()
+    }
+    usage[today] = gemini_calls_today() + 1
+    _BOT_STATE["gemini_usage"] = usage
+    save_bot_state(_BOT_STATE)
+
+
+def gemini_budget_status(reserve: int = 0) -> str:
+    """Return 'ok', 'daily' or 'run' describing remaining Gemini budget."""
+    if _gemini_hard_stop:
+        return "daily"
+    if gemini_calls_today() + reserve >= GEMINI_MAX_CALLS_PER_DAY:
+        return "daily"
+    if _gemini_run_calls >= GEMINI_MAX_CALLS_PER_RUN:
+        return "run"
+    return "ok"
+
+
+def gemini_budget_available(reserve: int = 0) -> bool:
+    return gemini_budget_status(reserve=reserve) == "ok"
+
+
 def fetch_feed(feed_url: str):
     response = requests.get(
         feed_url,
@@ -189,6 +370,319 @@ def send_telegram_message(
         payload["reply_markup"] = reply_markup
     response = requests.post(url, json=payload, timeout=30)
     response.raise_for_status()
+
+
+def answer_telegram_callback(
+    callback_query_id: str,
+    text: str = "",
+    *,
+    show_alert: bool = False,
+) -> None:
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/answerCallbackQuery"
+    payload = {
+        "callback_query_id": callback_query_id,
+        "text": (text or "")[:200],
+        "show_alert": show_alert,
+    }
+    response = requests.post(url, json=payload, timeout=30)
+    response.raise_for_status()
+
+
+def load_pack_requests() -> dict:
+    if not PACK_REQUESTS_FILE.exists():
+        return {}
+    try:
+        data = json.loads(PACK_REQUESTS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_pack_requests(requests_map: dict) -> None:
+    PACK_REQUESTS_FILE.write_text(
+        json.dumps(requests_map, indent=2),
+        encoding="utf-8",
+    )
+
+
+def register_pack_request(
+    title: str,
+    link: str,
+    source: str,
+    cv_name: str,
+    match_score: int,
+) -> str:
+    """Store metadata for an on-demand application pack; return short request id."""
+    requests_map = load_pack_requests()
+    req_id = hashlib.sha1(f"{link}|{cv_name}|{title}".encode("utf-8")).hexdigest()[:10]
+    requests_map[req_id] = {
+        "title": title,
+        "link": link,
+        "source": source,
+        "cv_name": cv_name,
+        "match_score": int(match_score),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_pack_requests(requests_map)
+    return req_id
+
+
+def pack_request_keyboard(req_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "Generate cover letter + CV",
+                    "callback_data": f"pack:{req_id}",
+                }
+            ]
+        ]
+    }
+
+
+def _load_telegram_offset() -> int:
+    try:
+        return int(_BOT_STATE.get("telegram_offset") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _save_telegram_offset(offset: int) -> None:
+    _BOT_STATE["telegram_offset"] = int(offset)
+    save_bot_state(_BOT_STATE)
+
+
+def _confirm_telegram_updates(offset: int) -> None:
+    """Acknowledge updates server-side so Telegram never replays them.
+
+    Local offset state can be lost (a cold GitHub Actions cache resets it to 0),
+    which used to replay up to 24h of old button taps and regenerate packs.
+    Calling getUpdates with a higher offset deletes them on Telegram's side, so
+    correctness no longer depends on our own state surviving.
+    """
+    try:
+        requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+            params={"offset": int(offset), "timeout": 0, "limit": 1},
+            timeout=20,
+        )
+    except Exception as exc:
+        print(f"Warning: could not confirm Telegram offset {offset}: {exc}")
+
+
+def _pack_meta_from_message(message: dict) -> dict | None:
+    """Rebuild pack metadata from the alert message that carried the button.
+
+    Telegram echoes the original message with every callback query, so a tapped
+    button still works after pack_requests.json is gone.
+    """
+    text = (message or {}).get("text") or ""
+    if not text:
+        return None
+
+    def field(label: str) -> str:
+        match = re.search(rf"^{re.escape(label)}:\s*(.+)$", text, re.M)
+        return match.group(1).strip() if match else ""
+
+    link_match = re.search(r"https?://\S+", text)
+    title = field("Job Title")
+    if not title or not link_match:
+        return None
+
+    score_match = re.search(r"Match Score:\s*(\d+)", text)
+    source_match = re.search(r"New Job Match \(([^)]+)\)", text)
+    return {
+        "title": title,
+        "link": link_match.group(0).rstrip(").,"),
+        "source": source_match.group(1).strip() if source_match else "Telegram",
+        "cv_name": field("Matched CV"),
+        "match_score": int(score_match.group(1)) if score_match else 0,
+        "recovered": True,
+    }
+
+
+def _remove_message_buttons(chat_id: str, message_id: int) -> None:
+    """Strip the inline keyboard so a fulfilled pack can't be requested twice."""
+    if not chat_id or not message_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageReplyMarkup",
+            json={
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "reply_markup": {"inline_keyboard": []},
+            },
+            timeout=20,
+        )
+    except Exception as exc:
+        print(f"Warning: could not remove inline keyboard: {exc}")
+
+
+def _cv_text_for_name(cv_name: str, active_cvs: list[dict] | None = None) -> str:
+    cvs = active_cvs if active_cvs is not None else load_active_cvs()
+    target = (cv_name or "").strip().lower()
+    for cv in cvs:
+        if (cv.get("name") or "").strip().lower() == target:
+            return cv.get("text") or ""
+    return resume_text or ""
+
+
+def fulfill_pack_request(
+    req_id: str,
+    active_cvs: list[dict] | None = None,
+    fallback_meta: dict | None = None,
+) -> bool:
+    """Generate cover letter + tailored CV for a pack request.
+
+    Falls back to metadata recovered from the Telegram message when the local
+    request store is missing (cold CI cache), so the button always works.
+    """
+    requests_map = load_pack_requests()
+    meta = requests_map.get(req_id) or fallback_meta
+    if not meta:
+        print(f"Pack request not found and not recoverable: {req_id}")
+        return False
+    if meta.get("recovered"):
+        print(f"Recovered pack request {req_id} from Telegram message.")
+        requests_map[req_id] = meta
+
+    title = meta.get("title") or "Job"
+    link = meta.get("link") or ""
+    cv_name = meta.get("cv_name") or ""
+    match_score = int(meta.get("match_score") or 0)
+
+    cv_text = _cv_text_for_name(cv_name, active_cvs=active_cvs)
+    job_text = fetch_clean_job_text(link, rss_fallback=title)
+    materials = generate_application_pack_with_gemini(
+        title,
+        job_text,
+        candidate_resume=cv_text,
+    )
+    cover_letter = materials.get("cover_letter") or ""
+    tailored_cv = materials.get("tailored_cv") or ""
+    if not cover_letter and not tailored_cv:
+        print(f"Pack generation empty for {req_id} ({title})")
+        return False
+
+    pdf_path = None
+    try:
+        pdf_path = generate_application_pdf(title, cover_letter, tailored_cv)
+        send_telegram_document(
+            pdf_path,
+            caption=(
+                f"Application pack for {title}\n"
+                f"Matched CV: {cv_name} ({match_score}%)"
+            ),
+        )
+    finally:
+        if pdf_path and os.path.exists(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except OSError:
+                pass
+
+    requests_map[req_id]["fulfilled_at"] = datetime.now(timezone.utc).isoformat()
+    save_pack_requests(requests_map)
+    print(f"Fulfilled pack request {req_id} for {title}")
+    return True
+
+
+def process_telegram_pack_callbacks(active_cvs: list[dict] | None = None) -> int:
+    """Poll Telegram callback queries and fulfill Generate-pack button presses.
+
+    Safe for cron: reads getUpdates, advances offset, generates packs only when
+    the user taps the button (saves Gemini quota on every RSS scan).
+    """
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return 0
+
+    offset = _load_telegram_offset()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    try:
+        response = requests.get(
+            url,
+            params={
+                "offset": offset,
+                "timeout": 0,
+                "allowed_updates": json.dumps(["callback_query"]),
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        updates = response.json().get("result") or []
+    except Exception as exc:
+        print(f"Telegram getUpdates failed: {exc}")
+        return 0
+
+    fulfilled = 0
+    for update in updates:
+        update_id = int(update.get("update_id") or 0)
+        if update_id >= offset:
+            offset = update_id + 1
+
+        callback = update.get("callback_query") or {}
+        callback_id = callback.get("id") or ""
+        data = (callback.get("data") or "").strip()
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        chat_id = str(chat.get("id") or "")
+        message_id = message.get("message_id")
+
+        if chat_id and chat_id != str(TELEGRAM_CHAT_ID):
+            if callback_id:
+                try:
+                    answer_telegram_callback(callback_id, "Unauthorized chat.")
+                except Exception:
+                    pass
+            continue
+
+        if not data.startswith("pack:"):
+            if callback_id:
+                try:
+                    answer_telegram_callback(callback_id, "Unknown action.")
+                except Exception:
+                    pass
+            continue
+
+        req_id = data.split(":", 1)[1].strip()
+        try:
+            answer_telegram_callback(
+                callback_id,
+                "Generating cover letter + CV…",
+            )
+        except Exception as exc:
+            print(f"answerCallbackQuery failed: {exc}")
+
+        try:
+            if fulfill_pack_request(
+                req_id,
+                active_cvs=active_cvs,
+                fallback_meta=_pack_meta_from_message(message),
+            ):
+                fulfilled += 1
+                _remove_message_buttons(chat_id, message_id)
+            else:
+                send_telegram_message(
+                    "Could not generate the application pack "
+                    "(Gemini quota or missing job/CV text). Try again later."
+                )
+        except Exception as exc:
+            print(f"Pack fulfill error for {req_id}: {exc}")
+            try:
+                send_telegram_message(
+                    f"Pack generation failed: {html_escape(str(exc))[:500]}"
+                )
+            except Exception:
+                pass
+
+    if updates:
+        _save_telegram_offset(offset)
+        _confirm_telegram_updates(offset)
+    if fulfilled:
+        RUN_STATS["packs"] += fulfilled
+        print(f"Fulfilled {fulfilled} on-demand application pack(s).")
+    return fulfilled
 
 
 def _pdf_safe_text(text: str) -> str:
@@ -340,7 +834,9 @@ def format_job_message(
         f"🎯 <b>Match Score:</b> {int(match_score)}%\n"
         f"🔑 <b>Keywords:</b> {html_escape(keyword_text)}\n\n"
         f"<b>Link:</b>\n"
-        f"{link}"
+        f"{link}\n\n"
+        f"<i>Tap the button below to generate a cover letter + tailored CV "
+        f"(uses Gemini only when requested).</i>"
     )
 
 
@@ -602,30 +1098,42 @@ def _cv_text_from_page(notion: Client, page: dict, applicant_name: str) -> str:
     file_url, file_name = _cv_file_url(page)
 
     if file_url:
-        try:
-            response = requests.get(file_url, timeout=60)
-            response.raise_for_status()
-            cv_text = _extract_pdf_text(response.content)
-            if len(cv_text.strip()) >= MIN_CV_TEXT_CHARS:
-                print(
-                    f"CV Vault: downloaded and parsed PDF for '{applicant_name}' "
-                    f"({file_name}, {len(cv_text)} chars)."
-                )
-                return cv_text.strip()
-            print(
-                "PDF text extraction returned less than 100 characters. "
-                "Attempting fallback to Notion Page Body..."
-            )
-        except Exception as exc:
+        # A one-off network timeout here used to silently demote the run to the
+        # placeholder resume.txt, producing bogus 0% scores. Retry first.
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = requests.get(file_url, timeout=30)
+                response.raise_for_status()
+                cv_text = _extract_pdf_text(response.content)
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                cv_text = ""
+                if attempt < 2:
+                    print(
+                        f"CV Vault: PDF download attempt {attempt + 1} failed for "
+                        f"'{applicant_name}' ({exc}); retrying..."
+                    )
+                    time.sleep(3)
+
+        if last_error is not None:
             print(
                 f"CV Vault: PDF download/parse failed for '{applicant_name}' "
-                f"({file_name}): {exc}"
+                f"({file_name}): {last_error}"
             )
+        elif len(cv_text.strip()) >= MIN_CV_TEXT_CHARS:
             print(
-                "PDF text extraction returned less than 100 characters. "
-                "Attempting fallback to Notion Page Body..."
+                f"CV Vault: downloaded and parsed PDF for '{applicant_name}' "
+                f"({file_name}, {len(cv_text)} chars)."
             )
-            cv_text = ""
+            return cv_text.strip()
+        else:
+            print(
+                f"PDF text extraction returned less than {MIN_CV_TEXT_CHARS} "
+                "characters. Attempting fallback to Notion Page Body..."
+            )
     else:
         # No PDF attached — go straight to page body (same validation rules).
         print(
@@ -705,7 +1213,18 @@ def _query_active_cv_pages(notion: Client, database_id: str) -> list[dict]:
     return pages
 
 
+_ACTIVE_CVS_CACHE: list[dict] | None = None
+
+
 def load_active_cvs() -> list[dict]:
+    """Return active CV profiles, loading from Notion once per run."""
+    global _ACTIVE_CVS_CACHE
+    if _ACTIVE_CVS_CACHE is None:
+        _ACTIVE_CVS_CACHE = _load_active_cvs_from_notion()
+    return _ACTIVE_CVS_CACHE
+
+
+def _load_active_cvs_from_notion() -> list[dict]:
     """Load active applicant profiles from Notion CV Vault.
 
     CV Vault required properties:
@@ -748,6 +1267,7 @@ def load_active_cvs() -> list[dict]:
     try:
         pages = _query_active_cv_pages(notion, NOTION_CV_VAULT_ID)
         active_cvs: list[dict] = []
+        skipped: list[str] = []
         for page in pages:
             name = _page_title(page)
             minimum_score = _page_minimum_score(page, default=0)
@@ -756,6 +1276,7 @@ def load_active_cvs() -> list[dict]:
             if len(text.strip()) < MIN_CV_TEXT_CHARS:
                 # Warning already logged inside _cv_text_from_page when both
                 # PDF and page body failed the 100-character check.
+                skipped.append(name)
                 continue
             active_cvs.append(
                 {
@@ -767,8 +1288,18 @@ def load_active_cvs() -> list[dict]:
                 }
             )
 
+        if skipped:
+            RUN_STATS["warnings"].append(
+                f"CV Vault: no readable text for {', '.join(skipped)} "
+                "(attach a text-based PDF or paste the CV into the page body, "
+                "or untick Active)"
+            )
+
         if not active_cvs:
             print("CV Vault: no active CVs with resume text; using resume.txt fallback.")
+            RUN_STATS["warnings"].append(
+                "CV Vault unusable — scoring against local resume.txt"
+            )
             return fallback
 
         print(f"CV Vault: loaded {len(active_cvs)} active CV(s).")
@@ -784,15 +1315,39 @@ def load_active_cvs() -> list[dict]:
         return fallback
 
 
-def safe_gemini_generate(prompt: str, max_retries: int = 3):
-    """Call Gemini generate_content with exponential backoff on rate/service errors.
+def _is_daily_quota_error(exc: Exception) -> bool:
+    """Distinguish per-day quota (retrying is futile) from per-minute throttling."""
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("perday", "per day", "requests per day", "generate_requests_per_model_per_day")
+    )
 
-    Retries on ResourceExhausted, ServiceUnavailable, and InternalServerError.
-    wait_time = 10 * (2 ** attempt) seconds between tries.
-    Returns the response object, or None if all retries fail.
+
+def safe_gemini_generate(prompt: str, max_retries: int = 3, reserve: int = 0):
+    """Call Gemini with budget checks and short backoff on transient errors.
+
+    Returns the response object, or None when the call was skipped or failed.
+    A per-day quota error sets a hard stop for the rest of the run instead of
+    sleeping through three doomed retries (which used to add ~30s per job).
     """
+    global _gemini_hard_stop
+
     if not GEMINI_API_KEY:
         print("Gemini skipped: GEMINI_API_KEY not set.")
+        return None
+
+    budget = gemini_budget_status(reserve=reserve)
+    if budget != "ok":
+        limit = (
+            f"daily cap {GEMINI_MAX_CALLS_PER_DAY}"
+            if budget == "daily"
+            else f"per-run cap {GEMINI_MAX_CALLS_PER_RUN}"
+        )
+        print(
+            f"Gemini skipped: {limit} reached "
+            f"({gemini_calls_today()} used today, {_gemini_run_calls} this run)."
+        )
         return None
 
     genai.configure(api_key=GEMINI_API_KEY)
@@ -804,21 +1359,33 @@ def safe_gemini_generate(prompt: str, max_retries: int = 3):
         },
     )
 
+    record_gemini_call()
     for attempt in range(max_retries):
         try:
             return model.generate_content(prompt)
-        except (ResourceExhausted, ServiceUnavailable, InternalServerError) as exc:
-            wait_time = 10 * (2 ** attempt)
-            if attempt >= max_retries - 1:
+        except ResourceExhausted as exc:
+            if _is_daily_quota_error(exc):
+                _gemini_hard_stop = True
                 print(
-                    f"ERROR: Gemini API failed after {max_retries} attempts "
-                    f"({type(exc).__name__}: {exc}). Giving up."
+                    "Gemini daily quota exhausted. Stopping Gemini calls for this "
+                    "run; unscored jobs stay queued for the next run."
                 )
                 return None
-            print(
-                f"API limit hit or service unavailable. "
-                f"Retrying in {wait_time} seconds..."
-            )
+            if attempt >= max_retries - 1:
+                print(f"ERROR: Gemini rate limited after {max_retries} attempts: {exc}")
+                return None
+            wait_time = 5 * (attempt + 1)
+            print(f"Gemini rate limited. Retrying in {wait_time}s...")
+            time.sleep(wait_time)
+        except (ServiceUnavailable, InternalServerError) as exc:
+            if attempt >= max_retries - 1:
+                print(
+                    f"ERROR: Gemini unavailable after {max_retries} attempts "
+                    f"({type(exc).__name__}: {exc})."
+                )
+                return None
+            wait_time = 5 * (attempt + 1)
+            print(f"Gemini service error. Retrying in {wait_time}s...")
             time.sleep(wait_time)
         except Exception as exc:
             print(f"Gemini generate_content error: {exc}")
@@ -832,21 +1399,20 @@ def analyze_job_with_gemini(
     description: str,
     candidate_resume: str = "",
 ) -> dict:
-    """Compare a candidate resume to a job posting with Gemini.
+    """Score a job against a CV with Gemini (match_score + keywords only).
 
-    Returns {
-      "match_score": int,
-      "keywords": list[str],
-      "cover_letter": str,
-      "tailored_cv": str,
-    }.
-    On failure defaults to score 0, ["AI Parse Failed"], and empty strings.
+    Cover letters / tailored CVs are generated later on demand via Telegram button
+    to conserve free-tier Gemini quota.
+
+    The returned "status" tells the caller how to treat a non-score:
+      ok          -- real score, safe to alert on
+      unavailable -- no key / budget / quota / outage: leave the job queued
+      error       -- Gemini replied with unusable JSON: don't retry forever
     """
     fallback = {
         "match_score": 0,
         "keywords": ["AI Parse Failed"],
-        "cover_letter": "",
-        "tailored_cv": "",
+        "status": "unavailable",
     }
     if not GEMINI_API_KEY:
         print("Gemini skipped: GEMINI_API_KEY not set.")
@@ -858,27 +1424,22 @@ def analyze_job_with_gemini(
     )
     prompt = (
         "You are an expert technical recruiter. Evaluate the provided job description "
-        "against the candidate's CV. Return a strict JSON response with four keys: "
+        "against the candidate's CV. Return a strict JSON response with exactly two keys: "
         "'match_score' (an integer from 0 to 100 representing the probability of a "
-        "strong match based strictly on the candidate's documented experience), "
+        "strong match based strictly on the candidate's documented experience) and "
         "'keywords' (a list of 3 to 5 critical skills required by the job that are "
         "EXPLICITLY present in the candidate's CV. Do not list skills the job requires "
-        "if the candidate does not possess them), "
-        "'cover_letter' (a string: if match_score is high, write a highly persuasive "
-        "cover letter focused on the overlapping skills between the CV and the job; "
-        "otherwise use an empty string), and "
-        "'tailored_cv' (a string: if match_score is high, rewrite the provided CV's "
-        "summary and bullet points to specifically mirror the terminology and "
-        "requirements of the job description WITHOUT inventing fake experience; "
-        "otherwise use an empty string).\n\n"
+        "if the candidate does not possess them). Do not include cover letters or "
+        "rewritten CVs.\n\n"
         f"Candidate resume:\n{cv_content}\n\n"
         f"Job description:\n{job_description}"
     )
 
+    response = safe_gemini_generate(prompt, reserve=GEMINI_PACK_RESERVE)
+    if response is None:
+        return fallback
+
     try:
-        response = safe_gemini_generate(prompt)
-        if response is None:
-            return fallback
         data = json.loads(response.text)
         match_score = int(data["match_score"])
         keywords = [
@@ -890,16 +1451,53 @@ def analyze_job_with_gemini(
             raise ValueError(f"match_score out of range: {match_score}")
         if not keywords:
             keywords = ["AI Parse Failed"]
-        cover_letter = str(data.get("cover_letter") or "").strip()
-        tailored_cv = str(data.get("tailored_cv") or "").strip()
         return {
             "match_score": match_score,
             "keywords": keywords[:5],
-            "cover_letter": cover_letter,
-            "tailored_cv": tailored_cv,
+            "status": "ok",
         }
     except Exception as exc:
-        print(f"Gemini error: {exc}")
+        print(f"Gemini returned unusable JSON: {exc}")
+        return {**fallback, "status": "error"}
+
+
+def generate_application_pack_with_gemini(
+    title: str,
+    description: str,
+    candidate_resume: str = "",
+) -> dict:
+    """On-demand Gemini call: cover letter + tailored CV only."""
+    fallback = {"cover_letter": "", "tailored_cv": ""}
+    if not GEMINI_API_KEY:
+        print("Gemini pack skipped: GEMINI_API_KEY not set.")
+        return fallback
+
+    cv_content = candidate_resume or resume_text or "No resume provided."
+    job_description = (
+        f"Title: {title}\n\nDescription:\n{description or 'No description provided.'}"
+    )
+    prompt = (
+        "You are an expert technical recruiter and career coach. Using the candidate "
+        "CV and job description, return strict JSON with exactly two keys:\n"
+        "'cover_letter' (a persuasive cover letter focused on overlapping skills; "
+        "do not invent experience) and\n"
+        "'tailored_cv' (rewrite the CV summary and bullet points to mirror the job's "
+        "terminology WITHOUT inventing fake experience).\n\n"
+        f"Candidate resume:\n{cv_content}\n\n"
+        f"Job description:\n{job_description}"
+    )
+
+    try:
+        response = safe_gemini_generate(prompt)
+        if response is None:
+            return fallback
+        data = json.loads(response.text)
+        return {
+            "cover_letter": str(data.get("cover_letter") or "").strip(),
+            "tailored_cv": str(data.get("tailored_cv") or "").strip(),
+        }
+    except Exception as exc:
+        print(f"Gemini pack error: {exc}")
         return fallback
 
 
@@ -941,10 +1539,16 @@ def _notion_paragraph_blocks(text: str) -> list[dict]:
 
 def _job_tracker_page_children(cover_letter: str, tailored_cv: str) -> list[dict]:
     """Build Notion page body blocks for cover letter + tailored CV."""
+    cover = (cover_letter or "").strip() or (
+        "Not generated yet. Tap “Generate cover letter + CV” on the Telegram alert."
+    )
+    tailored = (tailored_cv or "").strip() or (
+        "Not generated yet. Tap “Generate cover letter + CV” on the Telegram alert."
+    )
     children: list[dict] = [_notion_heading_2("Auto-Generated Cover Letter")]
-    children.extend(_notion_paragraph_blocks(cover_letter))
+    children.extend(_notion_paragraph_blocks(cover))
     children.append(_notion_heading_2("Tailored CV"))
-    children.extend(_notion_paragraph_blocks(tailored_cv))
+    children.extend(_notion_paragraph_blocks(tailored))
     return children
 
 
@@ -1077,11 +1681,20 @@ def _contains_phrase(text: str, phrase: str) -> bool:
     return re.search(pattern, text.lower()) is not None
 
 
+def _link_implies_target_location(link: str) -> bool:
+    """True when the job URL itself indicates UAE/Gulf (board/path markers)."""
+    low = (link or "").lower()
+    if not low:
+        return False
+    return any(marker in low for marker in UAE_LOCATION_LINK_MARKERS)
+
+
 def matches_search_filters(title: str, description: str = "", link: str = "") -> bool:
     """Apply job_titles / locations / blocked_words from SEARCH_CONFIG.
 
     Location may appear in the title, RSS/page text, or the job URL (common for
-    Indeed/Bayt links), so the link is included in the location check.
+    Indeed/Bayt links), so the link is included in the location check. Known UAE
+    board hosts also count as a location match when scrapers return empty text.
     """
     title_lower = title.lower()
     combined = f"{title} {description} {link}".lower()
@@ -1093,8 +1706,10 @@ def matches_search_filters(title: str, description: str = "", link: str = "") ->
         return False
 
     locations = SEARCH_CONFIG["locations"]
-    if locations and not any(loc.lower() in combined for loc in locations):
-        return False
+    if locations:
+        text_match = any(loc.lower() in combined for loc in locations)
+        if not text_match and not _link_implies_target_location(link):
+            return False
 
     return True
 
@@ -1133,11 +1748,13 @@ def process_job(
     Winner logic:
       1. Skip if already seen / already in Job Tracker / fails search filters.
       2. Fetch job text (trafilatura, RSS fallback).
-      3. For each CV: Gemini score + optional cover_letter/tailored_cv; keep the
-         highest score that also meets that CV's Minimum Score.
-      4. After all CVs: at most one Notion row (with cover letter + tailored CV in
-         the page body) and one Telegram alert for the winner.
-      5. time.sleep(5) after each CV Gemini call to throttle API usage.
+      3. For each CV: Gemini score + keywords only (no cover letter/CV rewrite).
+      4. After all CVs: at most one Notion row and one Telegram alert with a
+         Generate-pack button (on-demand Gemini write).
+
+    A job is only added to `seen` once it has been genuinely decided. If Gemini
+    was unavailable (budget/quota/outage) the link is left unseen so the next
+    run picks it up instead of losing it.
     """
     if not title or not link:
         return False
@@ -1177,10 +1794,15 @@ def process_job(
     # Prefer full page text for Gemini; keep RSS snippet for filters/metadata.
     gemini_description = fetch_clean_job_text(link, rss_fallback=description)
 
-    # Final filter using trafilatura page text + link (catches Dubai/UAE in body).
-    if not matches_search_filters(title, gemini_description, link=link):
+    # Final filter over every signal we have. The listing metadata (LinkedIn card
+    # location, RSS snippet) is authoritative and must not be dropped here: job
+    # pages often render the location in markup trafilatura strips out, so
+    # checking the scraped body alone rejected valid Dubai/Abu Dhabi roles.
+    combined_text = f"{description}\n{gemini_description}".strip()
+    if not matches_search_filters(title, combined_text, link=link):
         print(f"Filtered out after page extract: {title}")
-        seen.add(link)
+        RUN_STATS["filtered"] += 1
+        # Do NOT mark seen — empty scrapes / weak snippets should be retryable.
         return False
 
     details = parse_job_details(title, description)
@@ -1189,47 +1811,55 @@ def process_job(
     best_score = -1
     best_cv_name: str | None = None
     best_keywords: list[str] = []
-    best_cover_letter = ""
-    best_tailored_cv = ""
 
-    for cv in cvs:
+    for index, cv in enumerate(cvs):
         applicant_name = cv.get("name") or "Unnamed CV"
         cv_text = cv.get("text") or ""
         minimum_score = int(cv.get("minimum_score") or 0)
+        threshold = max(minimum_score, MIN_ALERT_SCORE)
 
         analysis = analyze_job_with_gemini(
             title,
             gemini_description,
             candidate_resume=cv_text,
         )
+        status = analysis.get("status")
+
+        if status == "unavailable":
+            # Budget/quota/outage: keep the job queued rather than burning it.
+            print(f"Gemini unavailable; deferring to a later run: {title}")
+            RUN_STATS["deferred_quota"] += 1
+            return False
+
         match_score = int(analysis["match_score"])
         keywords = list(analysis["keywords"])
-        cover_letter = str(analysis.get("cover_letter") or "")
-        tailored_cv = str(analysis.get("tailored_cv") or "")
+
+        if status != "ok":
+            print(
+                f"Gemini gave no usable score for {applicant_name}; "
+                f"skipping winner consideration for {title}"
+            )
+            continue
 
         print(
             f"Scored {applicant_name}: {match_score}% "
-            f"(minimum {minimum_score}%) for {title}"
+            f"(threshold {threshold}%) for {title}"
         )
 
-        if match_score >= minimum_score and match_score > best_score:
+        if match_score >= threshold and match_score > best_score:
             best_score = match_score
             best_cv_name = applicant_name
             best_keywords = keywords
-            best_cover_letter = cover_letter
-            best_tailored_cv = tailored_cv
+            print(f"New winner: {best_cv_name} at {best_score}% for {title}")
+        else:
             print(
-                f"New winner: {best_cv_name} at {best_score}% "
-                f"for {title}"
-            )
-        elif match_score < minimum_score:
-            print(
-                f"Below threshold ({match_score}% < {minimum_score}%) "
+                f"Below threshold ({match_score}% < {threshold}%) "
                 f"for {applicant_name}: {title}"
             )
 
-        # Proactive throttle between CV evaluations against the same job.
-        time.sleep(5)
+        # Space out calls between CV evaluations against the same job.
+        if index < len(cvs) - 1 and GEMINI_CALL_SPACING_SECONDS > 0:
+            time.sleep(GEMINI_CALL_SPACING_SECONDS)
 
     sent = False
     if best_cv_name is not None:
@@ -1241,8 +1871,15 @@ def process_job(
             match_score=best_score,
             keywords=best_keywords,
             note=note,
-            cover_letter=best_cover_letter,
-            tailored_cv=best_tailored_cv,
+            cover_letter="",
+            tailored_cv="",
+        )
+        req_id = register_pack_request(
+            title,
+            link,
+            display_source,
+            best_cv_name,
+            best_score,
         )
         send_telegram_message(
             format_job_message(
@@ -1255,42 +1892,22 @@ def process_job(
                 best_keywords,
                 cv_name=best_cv_name,
             ),
+            reply_markup=pack_request_keyboard(req_id),
             disable_web_page_preview=False,
         )
 
-        pdf_path = None
-        try:
-            pdf_path = generate_application_pdf(
-                title,
-                best_cover_letter,
-                best_tailored_cv,
-            )
-            send_telegram_document(
-                pdf_path,
-                caption=(
-                    f"Application pack for {title}\n"
-                    f"Matched CV: {best_cv_name} ({best_score}%)"
-                ),
-            )
-        except Exception as pdf_exc:
-            print(f"PDF generate/send failed (continuing): {pdf_exc}")
-        finally:
-            if pdf_path and os.path.exists(pdf_path):
-                try:
-                    os.remove(pdf_path)
-                    print(f"Deleted local PDF: {pdf_path}")
-                except OSError as cleanup_exc:
-                    print(f"Could not delete PDF {pdf_path}: {cleanup_exc}")
-
         sent = True
+        RUN_STATS["alerts"] += 1
         print(
             f"Winner alert ({display_source}, {best_cv_name}, "
-            f"{best_score}%): {title}"
+            f"{best_score}%): {title} [pack:{req_id}]"
         )
     else:
         print(f"No CV met threshold for: {title}")
 
-    # Mark seen after evaluating all active CVs so we don't re-score forever.
+    # Mark seen only after a real decision (alert or below-threshold) so we do
+    # not re-score the same link every 15 minutes. Filter rejects and
+    # Gemini-unavailable jobs return earlier and stay unseen for a retry.
     seen.add(link)
     return sent
 
@@ -1299,13 +1916,14 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
     """Fetch Google Alerts RSS feeds and process only items newer than the cursor.
 
     Stops each feed when an entry.link matches Last Processed URL (from CV Vault).
-    After all feeds, PATCHes Last Processed URL on active CV rows to the newest
-    item from the first non-empty feed. Empty/None cursor = first run
-    (process all current items, then save the newest URL).
+    Advances Last Processed URL only when at least one new item was considered
+    (not when every feed immediately hits the existing cursor). Empty/None cursor
+    = first run (process current items, then save the newest URL).
     """
     feed_urls = load_feed_urls()
     if not feed_urls:
         print("No RSS_FEED_URLS configured; skipping RSS check.")
+        RUN_STATS["warnings"].append("RSS_FEED_URLS not configured")
         return 0
 
     cvs = active_cvs if active_cvs is not None else load_active_cvs()
@@ -1320,12 +1938,16 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
 
     new_alerts = 0
     newest_to_persist: str | None = None
+    any_new_considered = False
+    total_entries = 0
+    budget_stop = False
 
     for feed_url in feed_urls:
         try:
             feed = fetch_feed(feed_url)
         except requests.RequestException as exc:
             print(f"Failed to fetch feed {feed_url}: {exc}")
+            RUN_STATS["warnings"].append(f"RSS fetch failed: {feed_url[:60]}")
             continue
 
         if feed.bozo and not feed.entries:
@@ -1334,6 +1956,7 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
 
         source = source_label(feed_url, feed.feed.get("title", ""))
         entries = list(feed.entries or [])
+        total_entries += len(entries)
         print(
             f"[{source}] Fetched {len(entries)} "
             f"entr{'y' if len(entries) == 1 else 'ies'}."
@@ -1342,8 +1965,7 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
             continue
 
         newest_link = (entries[0].get("link") or "").strip()
-        if newest_to_persist is None and newest_link:
-            newest_to_persist = newest_link
+        feed_considered = 0
 
         for entry in entries:
             title = (entry.get("title") or "").strip()
@@ -1360,6 +1982,15 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
                 )
                 break
 
+            if not gemini_budget_available(reserve=GEMINI_PACK_RESERVE):
+                print("Gemini budget spent; leaving remaining RSS items for later.")
+                RUN_STATS["deferred_quota"] += 1
+                budget_stop = True
+                break
+
+            feed_considered += 1
+            any_new_considered = True
+            RUN_STATS["considered"] += 1
             description = entry_description(entry)
             if process_job(
                 title,
@@ -1371,15 +2002,172 @@ def run_rss_feeds(seen: set[str], active_cvs: list[dict] | None = None) -> int:
             ):
                 new_alerts += 1
 
-    if newest_to_persist:
+        # Only candidate-advance using feeds where we actually walked past
+        # the cursor (not feeds that stopped on the first entry).
+        if feed_considered > 0 and newest_link and newest_to_persist is None:
+            newest_to_persist = newest_link
+
+    RUN_STATS["sources"].append(f"Google Alerts RSS ({total_entries} entries)")
+    if total_entries == 0:
+        RUN_STATS["warnings"].append(
+            "All Google Alerts feeds returned 0 entries — recreate the alerts "
+            "with Delivery = RSS feed."
+        )
+
+    if budget_stop:
+        # Advancing the cursor here would skip the items we never scored.
+        print(
+            "Stopped early on Gemini budget; leaving Last Processed URL "
+            "unchanged so pending items are retried."
+        )
+    elif newest_to_persist and any_new_considered:
         if newest_to_persist != last_processed_url:
             update_last_processed_url(cvs, newest_to_persist)
         else:
             print(f"Last Processed URL already up to date ({newest_to_persist}).")
     else:
-        print("No RSS items found; leaving Last Processed URL unchanged.")
+        print(
+            "No new RSS items considered; leaving Last Processed URL unchanged."
+        )
 
     return new_alerts
+
+
+def _process_discovered_jobs(
+    jobs: list,
+    source_label_name: str,
+    seen: set[str],
+    active_cvs: list[dict] | None = None,
+) -> int:
+    """Score a list of discovered jobs against active CVs within Gemini budget."""
+    RUN_STATS["sources"].append(f"{source_label_name} ({len(jobs)} found)")
+    cvs = active_cvs if active_cvs is not None else load_active_cvs()
+    new_alerts = 0
+
+    for job in jobs:
+        if job.link in seen:
+            continue
+        if not gemini_budget_available(reserve=GEMINI_PACK_RESERVE):
+            print(
+                f"Gemini budget spent for this run; remaining {source_label_name} "
+                "jobs stay queued for the next run."
+            )
+            RUN_STATS["deferred_quota"] += 1
+            break
+        RUN_STATS["considered"] += 1
+        if process_job(
+            job.title,
+            job.link,
+            job.source,
+            seen,
+            description=job.location or job.title,
+            active_cvs=cvs,
+        ):
+            new_alerts += 1
+
+    return new_alerts
+
+
+def run_linkedin_search(seen: set[str], active_cvs: list[dict] | None = None) -> int:
+    """Poll LinkedIn public guest search — the deterministic primary source."""
+    if not LINKEDIN_SEARCH_ENABLED:
+        print("LinkedIn search disabled (LINKEDIN_SEARCH_ENABLED=false).")
+        return 0
+
+    try:
+        jobs = fetch_linkedin_jobs(
+            hours=LINKEDIN_SEARCH_HOURS,
+            max_jobs=LINKEDIN_MAX_JOBS,
+        )
+    except Exception as exc:
+        print(f"LinkedIn search failed: {exc}")
+        RUN_STATS["warnings"].append(f"LinkedIn search failed: {exc}")
+        return 0
+
+    return _process_discovered_jobs(jobs, "LinkedIn", seen, active_cvs=active_cvs)
+
+
+def run_indeed_search(seen: set[str], active_cvs: list[dict] | None = None) -> int:
+    """Discover Indeed UAE jobs via Google News RSS (direct Indeed scrapes are blocked)."""
+    if not INDEED_SEARCH_ENABLED:
+        print("Indeed search disabled (INDEED_SEARCH_ENABLED=false).")
+        return 0
+    try:
+        jobs = fetch_indeed_jobs(max_jobs=BOARD_MAX_JOBS)
+    except Exception as exc:
+        print(f"Indeed search failed: {exc}")
+        RUN_STATS["warnings"].append(f"Indeed search failed: {exc}")
+        return 0
+    return _process_discovered_jobs(jobs, "Indeed", seen, active_cvs=active_cvs)
+
+
+def run_bayt_search(seen: set[str], active_cvs: list[dict] | None = None) -> int:
+    """Discover Bayt UAE jobs via Google News RSS (direct Bayt scrapes are Cloudflare-blocked)."""
+    if not BAYT_SEARCH_ENABLED:
+        print("Bayt search disabled (BAYT_SEARCH_ENABLED=false).")
+        return 0
+    try:
+        jobs = fetch_bayt_jobs(max_jobs=BOARD_MAX_JOBS)
+    except Exception as exc:
+        print(f"Bayt search failed: {exc}")
+        RUN_STATS["warnings"].append(f"Bayt search failed: {exc}")
+        return 0
+    return _process_discovered_jobs(jobs, "Bayt", seen, active_cvs=active_cvs)
+
+
+def run_naukrigulf_search(
+    seen: set[str],
+    active_cvs: list[dict] | None = None,
+) -> int:
+    """Discover Naukrigulf UAE jobs via Google News RSS."""
+    if not NAUKRIGULF_SEARCH_ENABLED:
+        print("Naukrigulf search disabled (NAUKRIGULF_SEARCH_ENABLED=false).")
+        return 0
+    try:
+        jobs = fetch_naukrigulf_jobs(max_jobs=BOARD_MAX_JOBS)
+    except Exception as exc:
+        print(f"Naukrigulf search failed: {exc}")
+        RUN_STATS["warnings"].append(f"Naukrigulf search failed: {exc}")
+        return 0
+    return _process_discovered_jobs(jobs, "Naukrigulf", seen, active_cvs=active_cvs)
+
+
+def maybe_send_heartbeat(force: bool = False) -> None:
+    """Send a periodic status digest so a quiet bot proves it is still alive."""
+    if HEARTBEAT_HOURS <= 0 and not force:
+        return
+
+    now = datetime.now(timezone.utc)
+    last_raw = _BOT_STATE.get("last_heartbeat_at")
+    if not force and last_raw:
+        try:
+            last = datetime.fromisoformat(last_raw)
+            if now - last < timedelta(hours=HEARTBEAT_HOURS):
+                return
+        except ValueError:
+            pass
+
+    sources = ", ".join(RUN_STATS["sources"]) or "none reachable"
+    lines = [
+        "<b>Job Bot Heartbeat</b>",
+        f"<b>Checked:</b> {html_escape(sources)}",
+        f"<b>Jobs scored this run:</b> {RUN_STATS['considered']}",
+        f"<b>Alerts this run:</b> {RUN_STATS['alerts']}",
+        f"<b>Filtered out:</b> {RUN_STATS['filtered']}",
+        f"<b>Deferred (Gemini budget):</b> {RUN_STATS['deferred_quota']}",
+        f"<b>Gemini calls used today:</b> "
+        f"{gemini_calls_today()}/{GEMINI_MAX_CALLS_PER_DAY}",
+    ]
+    for warning in RUN_STATS["warnings"][:5]:
+        lines.append(f"⚠️ {html_escape(warning)}")
+
+    try:
+        send_telegram_message("\n".join(lines), disable_notification=True)
+        _BOT_STATE["last_heartbeat_at"] = now.isoformat()
+        save_bot_state(_BOT_STATE)
+        print("Heartbeat digest sent to Telegram.")
+    except Exception as exc:
+        print(f"Heartbeat send failed: {exc}")
 
 
 def run_past_week_backfill(
@@ -1409,8 +2197,14 @@ def main() -> None:
         "--backfill-days",
         type=int,
         default=0,
-        help="Also search Google for matching jobs from the past N days "
-        "(use 7 for one week). Direct site scraping is blocked by Cloudflare.",
+        help="Print free manual Google search links for the past N days "
+        "(use 7 for one week). Does not call paid CSE. For scoring curated "
+        "jobs, put them in backfill_week.json and run send_backfill.py.",
+    )
+    parser.add_argument(
+        "--heartbeat",
+        action="store_true",
+        help="Force a Telegram status digest at the end of this run.",
     )
     args = parser.parse_args()
 
@@ -1422,10 +2216,31 @@ def main() -> None:
     try:
         print("Loading active CVs from Notion CV Vault...")
         active_cvs = load_active_cvs()
+        print("Checking Telegram Generate-pack button presses...")
+        packs = process_telegram_pack_callbacks(active_cvs=active_cvs)
+        if packs:
+            print(f"Processed {packs} on-demand pack request(s).")
         seen = load_seen_jobs()
         print(f"Dedup state: {len(seen)} previously seen link(s).")
-        print("Checking Google Alerts RSS feeds...")
-        new_alerts = run_rss_feeds(seen, active_cvs=active_cvs)
+        print(
+            f"Gemini budget: {gemini_calls_today()}/{GEMINI_MAX_CALLS_PER_DAY} "
+            f"used today, up to {GEMINI_MAX_CALLS_PER_RUN} this run."
+        )
+
+        print("Searching Indeed (via Google News)...")
+        new_alerts = run_indeed_search(seen, active_cvs=active_cvs)
+
+        print("Searching Bayt (via Google News)...")
+        new_alerts += run_bayt_search(seen, active_cvs=active_cvs)
+
+        print("Searching Naukrigulf (via Google News)...")
+        new_alerts += run_naukrigulf_search(seen, active_cvs=active_cvs)
+
+        print("Searching LinkedIn...")
+        new_alerts += run_linkedin_search(seen, active_cvs=active_cvs)
+
+        print("Checking Google Alerts RSS feeds (secondary source)...")
+        new_alerts += run_rss_feeds(seen, active_cvs=active_cvs)
 
         if args.backfill_days > 0:
             new_alerts += run_past_week_backfill(
@@ -1436,6 +2251,7 @@ def main() -> None:
 
         save_seen_jobs(seen)
         print(f"Done. Sent {new_alerts} new alert(s).")
+        maybe_send_heartbeat(force=args.heartbeat)
     except Exception as exc:
         tb = traceback.format_exc()
         print(tb)

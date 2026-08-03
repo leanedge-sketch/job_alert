@@ -8,3 +8,8 @@ google_debug*
 bing_*
 *.html
 .DS_Store
+seen_jobs.json
+pack_requests.json
+telegram_offset.json
+bot_state.json
+application_*.pdf

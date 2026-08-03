@@ -2,13 +2,26 @@ name: Job Alert Scraper Schedule
 
 on:
   schedule:
-    # Every 15 minutes (GitHub may delay slightly under load)
-    - cron: "*/15 * * * *"
+    # Every 30 minutes. Free-tier Gemini is ~20 calls/day; 15-minute runs
+    # burned quota on retries. GitHub may delay cron slightly under load.
+    - cron: "*/30 * * * *"
   workflow_dispatch:
+    inputs:
+      heartbeat:
+        description: "Send a Telegram status digest at the end of the run"
+        type: boolean
+        default: true
+
+# Overlapping runs would double-alert and double-spend the Gemini daily quota.
+concurrency:
+  group: job-alert-scraper
+  cancel-in-progress: false
 
 jobs:
   run-scraper:
     runs-on: ubuntu-latest
+    # Google News URL decoding for Indeed/Bayt/Naukrigulf can take several minutes.
+    timeout-minutes: 30
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -17,16 +30,24 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
+          cache: pip
 
       - name: Install Dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore seen jobs cache
+      # seen_jobs.json    -> link dedup (Notion is the durable backstop)
+      # pack_requests.json-> metadata behind "Generate pack" buttons
+      # bot_state.json    -> Telegram offset, Gemini daily usage, heartbeat clock
+      - name: Restore bot state
         uses: actions/cache/restore@v4
         with:
-          path: seen_jobs.json
-          key: seen-jobs-${{ github.run_id }}
+          path: |
+            seen_jobs.json
+            pack_requests.json
+            bot_state.json
+          key: bot-state-${{ github.run_id }}
           restore-keys: |
+            bot-state-
             seen-jobs-
 
       - name: Run Scraper
@@ -38,11 +59,31 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           NOTION_CV_VAULT_ID: ${{ secrets.NOTION_CV_VAULT_ID }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python main.py
+          # Defaults live in main.py; repo Variables override when set.
+          GEMINI_MAX_CALLS_PER_DAY: ${{ vars.GEMINI_MAX_CALLS_PER_DAY }}
+          GEMINI_MAX_CALLS_PER_RUN: ${{ vars.GEMINI_MAX_CALLS_PER_RUN }}
+          MIN_ALERT_SCORE: ${{ vars.MIN_ALERT_SCORE }}
+          LINKEDIN_SEARCH_ENABLED: ${{ vars.LINKEDIN_SEARCH_ENABLED }}
+          LINKEDIN_SEARCH_HOURS: ${{ vars.LINKEDIN_SEARCH_HOURS }}
+          LINKEDIN_MAX_JOBS: ${{ vars.LINKEDIN_MAX_JOBS }}
+          INDEED_SEARCH_ENABLED: ${{ vars.INDEED_SEARCH_ENABLED }}
+          BAYT_SEARCH_ENABLED: ${{ vars.BAYT_SEARCH_ENABLED }}
+          NAUKRIGULF_SEARCH_ENABLED: ${{ vars.NAUKRIGULF_SEARCH_ENABLED }}
+          BOARD_MAX_JOBS: ${{ vars.BOARD_MAX_JOBS }}
+          HEARTBEAT_HOURS: ${{ vars.HEARTBEAT_HOURS }}
+        run: |
+          EXTRA=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.heartbeat }}" = "true" ]; then
+            EXTRA="--heartbeat"
+          fi
+          python main.py $EXTRA
 
-      - name: Save seen jobs cache
+      - name: Save bot state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: seen_jobs.json
-          key: seen-jobs-${{ github.run_id }}
+          path: |
+            seen_jobs.json
+            pack_requests.json
+            bot_state.json
+          key: bot-state-${{ github.run_id }}
